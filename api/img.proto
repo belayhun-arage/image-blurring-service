@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package img;
+
+option go_package = "/api;img";
+
+service ImageService {
+  rpc QueueImage (ImageRequest) returns (ImageResponse);
+}
+
+message ImageRequest {
+  string image_id = 1;
+}
+
+message ImageResponse {
+  string status = 1;
+}
