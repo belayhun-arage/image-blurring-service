@@ -2,22 +2,20 @@ package helper
 
 import (
 	"math/rand"
-	"time"
+	"sync"
 )
 
-// NUMBERS const numbers
 const NUMBERS = "1234567890"
-
-// CHARACTERS const field
 const CHARACTERS = "abcdefghijelmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_1234567890"
 
-var seededRand *rand.Rand = rand.New(
-	rand.NewSource(time.Now().UnixNano()))
+var mu sync.Mutex
 
 func GenerateRandomString(length int, charset string) string {
 	b := make([]byte, length)
+	mu.Lock()
 	for i := range b {
-		b[i] = charset[seededRand.Intn(len(charset))]
+		b[i] = charset[rand.Intn(len(charset))]
 	}
+	mu.Unlock()
 	return string(b)
 }

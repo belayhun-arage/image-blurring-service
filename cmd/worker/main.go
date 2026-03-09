@@ -1,14 +1,18 @@
-// Worker that processes image IDs from a channel
+// Worker that processes image IDs from a queue
 package main
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/belayhun-arage/image-blur-service/internal/queue"
 	"github.com/belayhun-arage/image-blur-service/platforms/helper"
@@ -17,63 +21,90 @@ import (
 	"github.com/subosito/gotenv"
 )
 
-var db *sql.DB
+type worker struct {
+	db *sql.DB
+}
 
 func init() {
-	err := gotenv.Load("../../.env")
-	if err != nil {
-		fmt.Println("Error loading .env file")
+	if err := gotenv.Load(".env"); err != nil {
+		log.Println("Warning: could not load .env file:", err)
 	}
 }
 
 func main() {
-	errr := queue.InitRedisQueue("localhost:6379")
-	if errr != nil {
-		log.Fatalf("Failed to connect to Redis: %v", errr)
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	if err := queue.InitRedisQueue(redisAddr); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
-	var err error
-	db, err = sql.Open("postgres", os.Getenv("DATABASE_URL"))
+	db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatalf("Failed to connect to DB: %v", err)
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	if err := db.Ping(); err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
-	go ProcessImages()
-	ProcessImages()
+
+	workerCount := 2
+	if v := os.Getenv("WORKER_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workerCount = n
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-quit
+		log.Println("Shutting down worker...")
+		cancel()
+	}()
+
+	w := &worker{db: db}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.processImages(ctx)
+		}()
+	}
+	wg.Wait()
+	log.Println("All workers stopped.")
 }
 
-func ProcessImages() {
+func (w *worker) processImages(ctx context.Context) {
 	for {
-		fmt.Println("Waiting for image jobs...")
-		imageID, err := queue.Dequeue()
+		log.Println("Waiting for image jobs...")
+		imageID, err := queue.Dequeue(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return // context cancelled, clean shutdown
+			}
 			log.Printf("Error while dequeuing: %v\n", err)
 			continue
 		}
-
-		// blurredPath, err := BlurImage(imageID)
-		// if err != nil {
-		// 	log.Printf("Failed to blur image: %v\n", err)
-		// 	continue
-		// }
-
-		// // Insert metadata into blurred_img table
-		// err = SaveBlurredImage(imageID, blurredPath)
-		// if err != nil {
-		// 	log.Printf("Failed to save metadata: %v\n", err)
-		// 	continue
-		// }
-
-		blurredPathPath, err := BlurImageWithImaging(imageID)
-		if err != nil {
-			log.Printf("Failed to blur image: %v\n", err)
+		if imageID == "" {
+			log.Println("Received empty image ID, skipping")
 			continue
 		}
 
-		// Insert metadata into blurred_img table
-		err = SaveBlurredImage(imageID, blurredPathPath)
+		blurredPath, err := blurImageWithImaging(imageID)
 		if err != nil {
-			log.Printf("Failed to save metadata: %v\n", err)
+			log.Printf("Failed to blur image %q: %v\n", imageID, err)
+			continue
+		}
+
+		if err := w.saveBlurredImage(imageID, blurredPath); err != nil {
+			log.Printf("Failed to save metadata for %q: %v\n", imageID, err)
 			continue
 		}
 
@@ -81,55 +112,25 @@ func ProcessImages() {
 	}
 }
 
-func BlurImage(imageID string) (string, error) {
-	const maxSizeKB = 20
-
+func blurImageWithImaging(imageID string) (string, error) {
 	assetsDir := os.Getenv("ASSETS_DIRECTORY")
 	if assetsDir == "" {
-		return "", fmt.Errorf("assets directory not set")
-	}
-	originalPath := filepath.Join(assetsDir, imageID)
-
-	// Output path
-	blurredName := helper.GenerateRandomString(12, helper.CHARACTERS) + "FFMPEG" + "_blurred.jpg"
-	blurredPath := filepath.Join(assetsDir, blurredName)
-
-	// FFmpeg command with gblur and JPEG compression
-	cmd := exec.Command("ffmpeg",
-		"-y",               // Overwrite if exists
-		"-i", originalPath, // Input file
-		"-vf", "gblur=sigma=20", // Gaussian blur
-		"-q:v", "5", // JPEG quality (1=best, 31=worst)
-		blurredPath, // Output file
-	)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("ffmpeg error: %s", stderr.String())
+		return "", fmt.Errorf("ASSETS_DIRECTORY not set")
 	}
 
-	// Check file size
-	info, err := os.Stat(blurredPath)
+	// Prevent path traversal: ensure the resolved path stays inside assetsDir
+	absAssets, err := filepath.Abs(assetsDir)
 	if err != nil {
-		return "", fmt.Errorf("could not stat output file: %w", err)
-	}
-
-	if info.Size() > maxSizeKB*1024 {
-		os.Remove(blurredPath) // Clean up if too big
-		return "", fmt.Errorf("blurred image exceeds %dKB: %d bytes", maxSizeKB, info.Size())
-	}
-
-	return blurredPath, nil
-}
-
-func BlurImageWithImaging(imageID string) (string, error) {
-	assetsDir := os.Getenv("ASSETS_DIRECTORY")
-	if assetsDir == "" {
-		return "", fmt.Errorf("assets directory not set")
+		return "", fmt.Errorf("could not resolve assets directory: %w", err)
 	}
 	originalPath := filepath.Join(assetsDir, imageID)
+	absOriginal, err := filepath.Abs(originalPath)
+	if err != nil {
+		return "", fmt.Errorf("could not resolve image path: %w", err)
+	}
+	if !strings.HasPrefix(absOriginal, absAssets+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid image ID: path traversal detected")
+	}
 
 	img, err := imaging.Open(originalPath)
 	if err != nil {
@@ -138,34 +139,18 @@ func BlurImageWithImaging(imageID string) (string, error) {
 
 	blurred := imaging.Blur(img, 8.0)
 
-	// Extract original extension and reuse it
 	ext := filepath.Ext(imageID)
-	blurredName := helper.GenerateRandomString(12, helper.CHARACTERS) + "Imaging" + "_blurred" + ext
+	blurredName := helper.GenerateRandomString(12, helper.CHARACTERS) + "_blurred" + ext
 	blurredPath := filepath.Join(assetsDir, blurredName)
 
-	err = imaging.Save(blurred, blurredPath)
-	if err != nil {
+	if err := imaging.Save(blurred, blurredPath); err != nil {
 		return "", fmt.Errorf("failed to save blurred image: %w", err)
 	}
 
 	return blurredPath, nil
 }
 
-func FetchImage(imageID string) ([]byte, error) {
-	// Mock: Read from a file path or dummy data
-	path := filepath.Join(os.Getenv("ASSETS_DIRECTORY"), imageID)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read image: %w", err)
-	}
-	return data, nil
-}
-
-func SaveBlurredImage(sourceID, blurredPath string) error {
-	fmt.Println("Saving blurred image metadata to DB...")
-	fmt.Println("Blurred image path:", blurredPath)
-	fmt.Println("Source image ID:", sourceID)
-	query := `INSERT INTO blurred_img (source_img_id, blurred_img_url) VALUES ($1, $2)`
-	_, err := db.Exec(query, sourceID, blurredPath)
+func (w *worker) saveBlurredImage(sourceID, blurredPath string) error {
+	_, err := w.db.Exec(`INSERT INTO blurred_img (source_img_id, blurred_img_url) VALUES ($1, $2)`, sourceID, blurredPath)
 	return err
 }

@@ -6,6 +6,7 @@ option go_package = "/api;img";
 
 service ImageService {
   rpc QueueImage (ImageRequest) returns (ImageResponse);
+  rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
 }
 
 message ImageRequest {
@@ -14,4 +15,12 @@ message ImageRequest {
 
 message ImageResponse {
   string status = 1;
+}
+
+message DeleteImageRequest {
+  string source_img_id = 1;
+}
+
+message DeleteImageResponse {
+  bool success = 1;
 }

@@ -1,0 +1,16 @@
+# Environment variables (contains secrets)
+.env
+
+# Go binaries
+bin/
+*.exe
+
+# Build output
+dist/
+
+# Test cache
+*.test
+
+# OS
+.DS_Store
+Thumbs.db
