@@ -1,35 +1,15 @@
+// Package queue defines the contract for a job queue used by this service.
 package queue
 
-import (
-	"context"
-	"fmt"
+import "context"
 
-	"github.com/redis/go-redis/v9"
-)
+// Queue is the interface for enqueuing and dequeuing image processing jobs.
+// Any implementation (Redis, in-memory, SQS, etc.) must satisfy this contract.
+type Queue interface {
+	// Enqueue adds an imageID to the back of the queue.
+	Enqueue(ctx context.Context, imageID string) error
 
-var rdb *redis.Client
-
-const queueName = "image_blur_queue"
-
-func InitRedisQueue(addr string) error {
-	rdb = redis.NewClient(&redis.Options{
-		Addr: addr,
-	})
-	return rdb.Ping(context.Background()).Err()
-}
-
-func Enqueue(ctx context.Context, imageID string) error {
-	return rdb.RPush(ctx, queueName, imageID).Err()
-}
-
-// Dequeue blocks until an item is available or ctx is cancelled.
-func Dequeue(ctx context.Context) (string, error) {
-	result, err := rdb.BLPop(ctx, 0, queueName).Result()
-	if err != nil {
-		return "", err
-	}
-	if len(result) < 2 {
-		return "", fmt.Errorf("unexpected BLPop result length: %d", len(result))
-	}
-	return result[1], nil
+	// Dequeue blocks until an imageID is available or ctx is cancelled.
+	// Returns context.Canceled or context.DeadlineExceeded on cancellation.
+	Dequeue(ctx context.Context) (string, error)
 }
